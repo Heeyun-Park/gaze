@@ -44,12 +44,20 @@ def main():
 
     parser.add_argument("--backbone", type=str, default="resnet18",
                         choices=["resnet18", "resnet34", "resnet50", "resnet101"])
+    parser.add_argument("--img_feature_dim", type=int, default=512,
+                        help="Feature dimension for LSTM (default: 512)")  # ★ added
 
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
 
     parser.add_argument("--resume", type=str, default=None, help="path to checkpoint for continuing training")  # ★ added
     parser.add_argument("--save_csv", action="store_true")
+
+    # ★ Training enhancements
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="Number of warmup epochs (default: 5)")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Gradient clipping max norm (default: 1.0)")
 
     args = parser.parse_args()
 
@@ -68,14 +76,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --------------------------------------------------------
-    # Transforms
+    # Transforms (★ Enhanced with Data Augmentation)
     # --------------------------------------------------------
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     transform_train = transforms.Compose([
         transforms.Resize((224, 224)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # ★
+        transforms.RandomRotation(degrees=10),  # ★ Small rotation
+        transforms.RandomHorizontalFlip(p=0.5),  # ★ Note: requires azimuth flip in dataset
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.1)),  # ★ Random occlusion
         normalize
     ])
     transform_eval = transforms.Compose([
@@ -100,14 +112,17 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Model / Optimizer
+    # Model / Optimizer (★ with img_feature_dim parameter)
     # --------------------------------------------------------
-    model = SwitchGazeNet(backbone=args.backbone, pretrained=True)
+    model = SwitchGazeNet(backbone=args.backbone, pretrained=True,
+                          img_feature_dim=args.img_feature_dim)
     model = torch.nn.DataParallel(model).to(device)
 
     criterion = PinBallLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # ★ Cosine Annealing with warmup (manual implementation)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
 
     print(f"[ExpDir] {exp_dir}")
     print(f"[Info] Train={len(train_loader.dataset)}, Val={len(val_loader.dataset)}")
@@ -163,14 +178,24 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Training loop (with resume)
+    # Training loop (with resume + warmup + gradient clipping)
     # --------------------------------------------------------
     best_ckpt_path = os.path.join(ckpt_dir, "best_model.pth.tar")
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_err = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        # ★ Learning rate warmup
+        if epoch < args.warmup_epochs:
+            warmup_lr = args.lr * (epoch + 1) / args.warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+            print(f"[Warmup] Epoch {epoch+1}/{args.warmup_epochs}, lr={warmup_lr:.6f}")
+
+        train_loss, train_err = train_one_epoch(model, train_loader, criterion, optimizer, device, args.grad_clip)
         val_err = validate(model, val_loader, device)
-        scheduler.step()
+
+        # ★ Apply scheduler after warmup
+        if epoch >= args.warmup_epochs:
+            scheduler.step()
 
         if val_err < best_val:
             best_val = val_err
@@ -221,9 +246,9 @@ def main():
 
 
 # ============================================================
-# Train / Validate / Eval
+# Train / Validate / Eval (★ with gradient clipping)
 # ============================================================
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip=1.0):
     model.train()
     loss_meter, err_meter = AverageMeter(), AverageMeter()
     pbar = tqdm(loader, desc="[Train]", ncols=100)
@@ -239,6 +264,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
         loss = criterion(pred, target, var)
         loss.backward()
+
+        # ★ Gradient clipping to prevent exploding gradients
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
         optimizer.step()
 
         err = compute_angular_error(pred, target)
