@@ -88,7 +88,149 @@ class GazeLSTM(nn.Module):
 
 
 # ============================================================
-# 2. SwitchGazeNet + Skeleton (HEAD_KP / UPPER_KP)
+# 2. DualPoseGazeNet - Occlusion-Robust Gaze Estimation
+#    - Head branch + Body branch (GazeLSTM)
+#    - Confidence-based weighted fusion
+#    - Skeleton-guided residual correction
+# ============================================================
+class DualPoseGazeNet(nn.Module):
+    """
+    DualPoseGazeNet: Occlusion-robust gaze estimation using dual-stream architecture.
+
+    This model combines head and upper-body information to predict gaze direction.
+    When the head is occluded, it relies more on body pose; when the body is occluded,
+    it relies more on head information. This makes it robust to partial occlusions
+    common in real-world scenarios.
+
+    Architecture:
+    1. Head Stream: GazeLSTM for head crop sequence
+    2. Body Stream: GazeLSTM for upper-body crop sequence
+    3. Confidence-based Weighting: Dynamically weights head/body predictions
+    4. Fusion Module: Skeleton-guided residual correction
+    """
+
+    def __init__(self, backbone: str = "resnet18", pretrained: bool = True):
+        super().__init__()
+
+        # Dual independent streams
+        self.head_net = GazeLSTM(backbone=backbone, pretrained=pretrained)
+        self.body_net = GazeLSTM(backbone=backbone, pretrained=pretrained)
+
+        # Skeleton keypoints dimensions:
+        # - head_vec: 5 keypoints × 3 (x, y, confidence) = 15
+        # - upper_vec: 8 keypoints × 3 (x, y, confidence) = 24
+        # - total: 39 dimensions
+        skel_dim = 15 + 24
+
+        # Fusion MLP: combines angles and skeleton for residual correction
+        # Input: head_ang(2) + body_ang(2) + head_vec(15) + upper_vec(24) = 43
+        fusion_input_dim = 2 + 2 + skel_dim
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(fusion_input_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 3),  # output: (delta_az, delta_el, delta_var)
+        )
+
+    def forward(self,
+                head_seq: torch.Tensor,
+                body_seq: torch.Tensor,
+                conf: torch.Tensor,
+                head_vec: torch.Tensor,
+                upper_vec: torch.Tensor):
+        """
+        Forward pass of DualPoseGazeNet.
+
+        Args:
+            head_seq: (B, 7, 3, 224, 224) - Head crop sequence (7 frames)
+            body_seq: (B, 7, 3, 224, 224) - Upper-body crop sequence (7 frames)
+            conf: (B, 2) - Confidence scores [head_conf, body_conf]
+                         1.0 = fully reliable, 0.0 = occluded/unavailable
+            head_vec: (B, 15) - Head keypoints (5 × [x, y, confidence])
+            upper_vec: (B, 24) - Upper-body keypoints (8 × [x, y, confidence])
+
+        Returns:
+            ang: (B, 2) - Predicted gaze angles (azimuth, elevation) in radians
+            var: (B, 2) - Prediction variance (uncertainty estimation)
+        """
+        B = head_seq.size(0)
+
+        # ================================================================
+        # Step 1: Extract predictions from both streams
+        # ================================================================
+        head_ang, head_var = self.head_net(head_seq)  # (B, 2), (B, 2)
+        body_ang, body_var = self.body_net(body_seq)  # (B, 2), (B, 2)
+
+        # ================================================================
+        # Step 2: Confidence-based weighted fusion
+        # ================================================================
+        # Normalize confidence scores to create weights
+        # If head_conf=1, body_conf=0 → w_h=1.0, w_b=0.0 (use head only)
+        # If head_conf=0, body_conf=1 → w_h=0.0, w_b=1.0 (use body only)
+        # If both available → weights based on relative confidence
+
+        head_conf = conf[:, 0:1]  # (B, 1)
+        body_conf = conf[:, 1:2]  # (B, 1)
+
+        # Avoid division by zero
+        conf_sum = torch.clamp(head_conf + body_conf, min=1e-6)
+
+        w_h = head_conf / conf_sum  # (B, 1)
+        w_b = body_conf / conf_sum  # (B, 1)
+
+        # Weighted average of predictions
+        ang_avg = w_h * head_ang + w_b * body_ang  # (B, 2)
+        var_avg = w_h * head_var + w_b * body_var  # (B, 2)
+
+        # ================================================================
+        # Step 3: Skeleton-guided residual correction
+        # ================================================================
+        # Combine all information for residual learning
+        fusion_input = torch.cat([
+            head_ang,    # (B, 2)
+            body_ang,    # (B, 2)
+            head_vec,    # (B, 15)
+            upper_vec    # (B, 24)
+        ], dim=1)  # (B, 43)
+
+        # Predict residual corrections
+        residual = self.fusion_mlp(fusion_input)  # (B, 3)
+
+        delta_az = residual[:, 0:1]  # azimuth correction
+        delta_el = residual[:, 1:2]  # elevation correction
+        delta_v  = residual[:, 2:3]  # variance correction
+
+        # ================================================================
+        # Step 4: Apply residual corrections with proper scaling
+        # ================================================================
+        # Angle corrections: apply tanh to keep in valid range, then mix
+        # α = 0.5 controls the residual contribution
+        alpha = 0.5
+
+        # Azimuth: [-π, π]
+        ang_final_az = (1 - alpha) * ang_avg[:, 0:1] + \
+                       alpha * math.pi * torch.tanh(delta_az)
+
+        # Elevation: [-π/2, π/2]
+        ang_final_el = (1 - alpha) * ang_avg[:, 1:2] + \
+                       alpha * (math.pi / 2) * torch.tanh(delta_el)
+
+        ang_final = torch.cat([ang_final_az, ang_final_el], dim=1)  # (B, 2)
+
+        # Variance correction: apply sigmoid, then mix
+        var_correction = math.pi * torch.sigmoid(delta_v)  # (B, 1)
+        var_correction = var_correction.expand(-1, 2)       # (B, 2)
+
+        var_final = (1 - alpha) * var_avg + alpha * var_correction  # (B, 2)
+
+        return ang_final, var_final
+
+
+# ============================================================
+# 3. SwitchGazeNet + Skeleton (HEAD_KP / UPPER_KP)
 #    - Head branch + Body branch (GazeLSTM)
 #    - Skeleton 기반 gating
 #    - Residual fusion refinement (skeleton 포함)
